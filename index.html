@@ -107,6 +107,20 @@ const ang = (a, b) => Math.atan2(b.y - a.y, b.x - a.x);
 const TAU = Math.PI * 2;
 const mix = (a, b, t) => a + (b - a) * t;
 
+// Swept collision: does the segment (x1,y1)->(x2,y2) pass within r of (cx,cy)?
+// A fast bullet can cross an enemy entirely between two frames; testing only the
+// endpoint lets it tunnel straight through. This closes that gap.
+function segCircleHit(x1, y1, x2, y2, cx, cy, r){
+  const dx = x2 - x1, dy = y2 - y1;
+  const fx = x1 - cx, fy = y1 - cy;
+  const a = dx*dx + dy*dy;
+  if (a < 1e-9) return (fx*fx + fy*fy) <= r*r;   // no movement: plain point test
+  let t = -(fx*dx + fy*dy) / a;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;                 // clamp to the segment
+  const nx = fx + t*dx, ny = fy + t*dy;
+  return (nx*nx + ny*ny) <= r*r;
+}
+
 /* ---------- audio ---------- */
 let AC = null;
 function ac(){
@@ -149,23 +163,37 @@ const SFX = {
 /* ---------- input ---------- */
 const keys = Object.create(null);
 const mouse = { x: 0, y: 0, down: false, active: false };
+// A quick click can begin AND end between two animation frames. Queue the press so
+// at least one frame sees it — otherwise single clicks fire nothing at all.
+let clickQueue = 0;
 let isTouch = false;
 
 addEventListener('keydown', e => {
-  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].indexOf(e.key) !== -1) e.preventDefault();
   keys[e.key.toLowerCase()] = true;
-  if (e.key === ' ') keys[' '] = true;
+  if (e.code === 'Space') keys[' '] = true;
 });
-addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; if (e.key === ' ') keys[' '] = false; });
+addEventListener('keyup', e => {
+  keys[e.key.toLowerCase()] = false;
+  if (e.code === 'Space') keys[' '] = false;
+});
+// hard reset if the tab loses focus while holding fire — otherwise the flag latches
+addEventListener('blur', () => {
+  mouse.down = false; keys[' '] = false; clickQueue = 0;
+  if (player) player.queuedShot = false;
+  for (const k in keys) keys[k] = false;
+  stick.x = 0; stick.y = 0; stick.mag = 0; touchActive = false;
+});
 
 cv.addEventListener('mousemove', e => {
   const r = cv.getBoundingClientRect();
   mouse.x = e.clientX - r.left; mouse.y = e.clientY - r.top;
-  mouse.active = true; mouse.down = (e.buttons & 1) === 1;
+  mouse.active = true;
+  // NEVER derive fire state from e.buttons here — unreliable across devices
 });
-cv.addEventListener('mousedown', e => { e.preventDefault(); mouse.down = true; ac(); });
+cv.addEventListener('mousedown', e => { e.preventDefault(); mouse.down = true; clickQueue++; ac(); });
 addEventListener('mouseup', () => { mouse.down = false; });
-cv.addEventListener('contextmenu', e => e.preventDefault());
+addEventListener('contextmenu', e => e.preventDefault());
 
 cv.addEventListener('touchstart', e => {
   e.preventDefault(); isTouch = true; touchActive = true;
@@ -228,8 +256,8 @@ const GUNS = {
 function makePlayer(){
   return {
     x: W/2, y: H/2, vx:0, vy:0, hp:100, maxhp:100,
-    kind:'pistol', r:15, ang:0, cd:0, dashCD:0, dashT:0, dashVX:0, dashVY:0,
-    iframe:0, recoil:0, muzzle:0, alive:true, level:1, xp:0, xpNext:100
+    kind:'pistol', r:20, ang:0, cd:0, dashCD:0, dashT:0, dashVX:0, dashVY:0,
+    iframe:0, recoil:0, muzzle:0, alive:true, level:1, xp:0, xpNext:100, queuedShot:false
   };
 }
 
@@ -237,7 +265,7 @@ function spawnEnemy(kind, x, y){
   const G = GUNS[kind];
   const scale = 1 + (wave - 1) * 0.13;
   return {
-    kind, x, y, vx:0, vy:0, r: G.boss ? 34 : 15,
+    kind, x, y, vx:0, vy:0, r: G.boss ? 42 : 20,
     hp: Math.round(G.hp * (G.boss ? 1 + (wave-1)*0.35 : scale)),
     maxhp: Math.round(G.hp * (G.boss ? 1 + (wave-1)*0.35 : scale)),
     spd: G.spd * (1 + (wave - 1) * 0.035),
@@ -268,7 +296,11 @@ function addBullet(x, y, a, spd, dmg, friendly, opts){
   });
 }
 
+const MAX_PARTS = 420;
 function burst(x, y, col, n, spd, size, life){
+  // hard cap: drop new particles rather than let the array grow unbounded
+  if (parts.length > MAX_PARTS) return;
+  n = Math.min(n, MAX_PARTS - parts.length);
   for (let i = 0; i < n; i++){
     const a = rnd(0, TAU), s = rnd(spd*.25, spd);
     parts.push({ x, y, vx: Math.cos(a)*s, vy: Math.sin(a)*s,
@@ -340,8 +372,7 @@ function update(dt){
 
   // dash
   if (P.dashCD > 0) P.dashCD -= dt;
-  if ((keys['shift'] || keys[' '] === false) && false) {}
-  if ((keys['shift'] || keys['shiftleft']) && P.dashCD <= 0 && (mx || my)) doDash();
+  if (keys['shift'] && P.dashCD <= 0 && (mx || my)) doDash();
   if (P.dashT > 0){
     P.dashT -= dt;
     P.x += P.dashVX * dt; P.y += P.dashVY * dt;
@@ -354,22 +385,48 @@ function update(dt){
   }
   P.x = clamp(P.x, 22, W - 22); P.y = clamp(P.y, 22, H - 22);
 
-  // aim
+  // aim — if the crosshair isn't on anything, fall back to the nearest enemy in front
+  // of the player. Without this, a stationary cursor fires into empty space forever.
   let aimX = mouse.x, aimY = mouse.y;
-  if (isTouch && touchActive === false) { /* keep last */ }
+  if (running && enemies.length){
+    let bestE = null, bestScore = Infinity;
+    for (const e of enemies){
+      const d = Math.hypot(e.x - aimX, e.y - aimY);
+      const snapR = e.r + 40;
+      if (d < snapR && d < bestScore){ bestScore = d; bestE = e; }
+    }
+    if (!bestE){
+      // no target under the cursor: pick the nearest enemy within a wide cone ahead
+      const facing = Math.atan2(aimY - P.y, aimX - P.x);
+      let coneBest = null, coneD = Infinity, anyBest = null, anyD = Infinity;
+      for (const e of enemies){
+        const ed = Math.hypot(e.x - P.x, e.y - P.y);
+        if (ed < anyD){ anyD = ed; anyBest = e; }
+        const ea = Math.atan2(e.y - P.y, e.x - P.x);
+        let diff = Math.abs(((ea - facing + Math.PI * 3) % (Math.PI * 2)) - Math.PI);
+        if (diff < 0.9 && ed < coneD){ coneD = ed; coneBest = e; }
+      }
+      bestE = coneBest || anyBest;
+    }
+    if (bestE){ aimX = bestE.x; aimY = bestE.y; }
+  }
   P.ang = Math.atan2(aimY - P.y, aimX - P.x);
   if (P.recoil > 0) P.recoil = Math.max(0, P.recoil - dt * 9);
   if (P.muzzle > 0) P.muzzle = Math.max(0, P.muzzle - dt * 14);
   if (P.iframe > 0) P.iframe -= dt;
 
   // fire
-  if (P.cd > 0) P.cd -= dt;
-  const firing = mouse.down || keys[' '] || keys['space'];
-  if (firing && P.cd <= 0){
+  if (P.cd > 0) { P.cd -= dt; if (P.cd < 0) P.cd = 0; }
+  // A click whose press+release both landed inside one frame must still fire once.
+  // Consume the queue here; caps at a single shot so a backlog can never burst.
+  if (clickQueue > 0){ clickQueue = 0; P.queuedShot = true; }
+  const firing = !!(mouse.down || keys[' ']);
+  if ((firing || P.queuedShot) && P.cd <= 0){
     P.cd = GUNS[P.kind].fireRate;
     shootPlayer();
+    P.queuedShot = false;
   }
-  updateAmmoUI(firing);
+  updateAmmoUI(firing || P.queuedShot);
 
   // ---- spawning
   if (running){
@@ -392,11 +449,12 @@ function update(dt){
     }
   }
 
-  // ---- bullets
+  // ---- bullets (swept collision: test the whole path, not just the endpoint)
   for (let i = bullets.length - 1; i >= 0; i--){
     const b = bullets[i];
     b.trail.push(b.x, b.y);
     if (b.trail.length > 8) b.trail.splice(0, 2);
+    const px = b.x, py = b.y;          // previous position
     b.x += b.vx * dt; b.y += b.vy * dt;
     b.life -= dt;
     if (b.life <= 0 || b.x < -40 || b.x > W + 40 || b.y < -40 || b.y > H + 40){
@@ -404,17 +462,23 @@ function update(dt){
     }
     if (b.friendly){
       let done = false;
-      for (let j = enemies.length - 1; j >= 0; j--){
+      // find the CLOSEST enemy actually hit this step, not merely the first in the
+      // array — otherwise fire splashes across the whole pack and nothing dies
+      let hitE = null, hitD = Infinity;
+      for (let j = 0; j < enemies.length; j++){
         const e = enemies[j];
-        if (dist(b, e) < e.r + b.r){
-          damageEnemy(e, b.dmg, b.x, b.y, b);
-          if (b.pierce > 0){ b.pierce--; } else { done = true; }
-          break;
+        if (segCircleHit(px, py, b.x, b.y, e.x, e.y, e.r + b.r)){
+          const dd = (e.x - b.x) * (e.x - b.x) + (e.y - b.y) * (e.y - b.y);
+          if (dd < hitD){ hitD = dd; hitE = e; }
         }
+      }
+      if (hitE){
+        damageEnemy(hitE, b.dmg, b.x, b.y, b);
+        if (b.pierce > 0){ b.pierce--; } else { done = true; }
       }
       if (done){ bullets.splice(i, 1); }
     } else {
-      if (P.iframe <= 0 && dist(b, P) < P.r + b.r){
+      if (P.iframe <= 0 && segCircleHit(px, py, b.x, b.y, P.x, P.y, P.r + b.r)){
         hurtPlayer(b.dmg);
         bullets.splice(i, 1);
       }
@@ -460,18 +524,26 @@ function update(dt){
     e.x += e.vx * dt; e.y += e.vy * dt;
     e.x = clamp(e.x, -30, W + 30); e.y = clamp(e.y, -30, H + 30);
 
-    // fire
+    // fire — only from a sane engagement range, and with real spread at distance.
+    // Firing from 620px made wave 1 an unwinnable firing squad.
     e.cd -= dt;
-    const inRange = d < 620;
+    const fireRange = e.boss ? 340 : (e.kind === 'sniper' ? 460 : e.kind === 'shotgun' ? 230 : 300);
+    const inRange = d < fireRange;
     if (e.cd <= 0 && inRange && P.alive){
-      e.cd = G.fireRate * rnd(.85, 1.2) * (e.boss ? .75 : 1);
+      // moving/evading enemies shoot less accurately — rewards not standing still
+      const distFrac = clamp(d / fireRange, 0, 1);
+      e.cd = G.fireRate * rnd(.85, 1.2) * (e.boss ? .75 : 1) * (1 + distFrac * 0.6);
       enemyShoot(e, G, d);
     }
 
-    // contact damage
+    // contact damage — a nudge, not a shredder. Enemies physically cannot sit inside
+    // the player because separation pushes them out; this is just the graze penalty.
     if (d < e.r + P.r && P.iframe <= 0 && !e.boss){
-      hurtPlayer(7);
-      e.vx -= dirx * 220; e.vy -= diry * 220;
+      hurtPlayer(3);
+      e.vx -= dirx * 320; e.vy -= diry * 320;
+      // knock the enemy out of the player's body so it can't chain-hit
+      const overlap = (e.r + P.r) - d + 2;
+      e.x -= dirx * overlap; e.y -= diry * overlap;
     }
   }
 
@@ -528,7 +600,9 @@ function doDash(){
 function shootPlayer(){
   const P = player, G = GUNS[P.kind];
   const a = P.ang + rnd(-G.bsprd, G.bsprd);
-  const mx = P.x + Math.cos(P.ang) * G.len, my = P.y + Math.sin(P.ang) * G.len;
+  // bullet originates at the muzzle tip — matches the drawn barrel end
+  const reach = G.len * 1.7 * 0.5;
+  const mx = P.x + Math.cos(P.ang) * reach, my = P.y + Math.sin(P.ang) * reach;
   addBullet(mx, my, a, G.bspd, G.dmg, true, { col:'#ffe9b0' });
   burst(mx, my, '#ffd9a0', 3, 190, 2.6, .18);
   P.recoil = 1; P.muzzle = 1;
@@ -542,7 +616,7 @@ function enemyShoot(e, G, d){
   for (let i = 0; i < pellets; i++){
     let a = baseA + rnd(-G.bsprd, G.bsprd);
     if (pellets > 1) a = baseA + (i / (pellets - 1) - .5) * G.bsprd * 2.6;
-    const mx = e.x + Math.cos(e.ang) * G.len, my = e.y + Math.sin(e.ang) * G.len;
+    const mx = e.x + Math.cos(e.ang) * G.len * 1.45 * .5, my = e.y + Math.sin(e.ang) * G.len * 1.45 * .5;
     addBullet(mx, my, a, G.bspd, G.dmg, false, {
       col: G.boss ? '#ff2222' : '#ff8a5c', r: G.boss ? 4 : 3, slug: G.slug,
       life: G.bspd > 1200 ? 1.1 : 1.5, pierce: 0
@@ -593,7 +667,7 @@ function hurtPlayer(dmg){
   const P = player;
   if (P.iframe > 0 || !P.alive) return;
   P.hp -= dmg;
-  P.iframe = .28;
+  P.iframe = .55;   // longer grace: enemies fire constantly, .28s let DPS stack to ~100hp/6s
   shake = Math.min(30, shake + 9);
   SFX.hurt();
   burst(P.x, P.y, '#ff5c3a', 9, 240, 4, .5);
@@ -649,12 +723,8 @@ function drawGun(x, y, a, kind, recoil, muzzle, hurt, scale, isPlayer){
   ctx.moveTo(-L*.22, 0); ctx.lineTo(-L*.22 - 6, -Wd*.7 - legPhase);
   ctx.stroke();
 
-  // body / receiver
-  const bodyGrad = ctx.createLinearGradient(-L*.5, -Wd, L*.5, Wd);
-  bodyGrad.addColorStop(0, G.col);
-  bodyGrad.addColorStop(.55, G.col2);
-  bodyGrad.addColorStop(1, G.col);
-  ctx.fillStyle = hurt > 0 ? '#ffffff' : bodyGrad;
+  // body / receiver — flat colour, no per-frame gradient allocation
+  ctx.fillStyle = hurt > 0 ? '#ffffff' : G.col;
   ctx.strokeStyle = 'rgba(0,0,0,.55)';
   ctx.lineWidth = 1.6;
 
@@ -662,19 +732,22 @@ function drawGun(x, y, a, kind, recoil, muzzle, hurt, scale, isPlayer){
   roundRect(-L*.5, -Wd*.55, L*.75, Wd*1.1, 3);
   ctx.fill(); ctx.stroke();
 
+  // lighter top plate sells the form without a gradient
+  ctx.fillStyle = G.col2;
+  roundRect(-L*.44, -Wd*.5, L*.6, Wd*.42, 2);
+  ctx.fill();
+
   // barrel
   ctx.fillStyle = '#1b2130';
   roundRect(L*.1, -Wd*.28, L*.55, Wd*.56, 2);
   ctx.fill(); ctx.stroke();
 
-  // muzzle glow
+  // muzzle glow — layered translucent circles, no gradient allocation
   if (muzzle > 0){
-    const g = ctx.createRadialGradient(L*.68, 0, 0, L*.68, 0, 22 * muzzle);
-    g.addColorStop(0, 'rgba(255,240,190,' + muzzle + ')');
-    g.addColorStop(.4, 'rgba(255,150,60,' + (muzzle*.6) + ')');
-    g.addColorStop(1, 'rgba(255,80,20,0)');
-    ctx.fillStyle = g;
-    ctx.beginPath(); ctx.arc(L*.68, 0, 22 * muzzle, 0, TAU); ctx.fill();
+    ctx.fillStyle = 'rgba(255,150,60,' + (muzzle*.28) + ')';
+    ctx.beginPath(); ctx.arc(L*.68, 0, 20 * muzzle, 0, TAU); ctx.fill();
+    ctx.fillStyle = 'rgba(255,240,190,' + (muzzle*.6) + ')';
+    ctx.beginPath(); ctx.arc(L*.68, 0, 10 * muzzle, 0, TAU); ctx.fill();
     // flash star
     ctx.fillStyle = 'rgba(255,250,220,' + muzzle + ')';
     ctx.beginPath();
@@ -742,8 +815,8 @@ function roundRect(x, y, w, h, r){
 }
 
 function drawEnemyHp(e){
-  const w = e.boss ? 90 : 28, h = e.boss ? 6 : 3;
-  const x = e.x - w/2, y = e.y - e.r - (e.boss ? 30 : 18);
+  const w = e.boss ? 96 : 34, h = e.boss ? 6 : 3;
+  const x = e.x - w/2, y = e.y - e.r - (e.boss ? 38 : 26);
   ctx.fillStyle = 'rgba(0,0,0,.6)';
   ctx.fillRect(x - 1, y - 1, w + 2, h + 2);
   const p = clamp(e.hp / e.maxhp, 0, 1);
@@ -751,6 +824,7 @@ function drawEnemyHp(e){
   ctx.fillRect(x, y, w * p, h);
 }
 
+let glowGrad = null, glowW = 0, glowH = 0;
 function drawGrid(){
   const gs = 64;
   const ox = (time * 8) % gs, oy = (time * 5) % gs;
@@ -761,11 +835,14 @@ function drawGrid(){
   for (let y = -oy; y < H + gs; y += gs){ ctx.moveTo(0, y); ctx.lineTo(W, y); }
   ctx.stroke();
 
-  // vignette-ish center glow
-  const g = ctx.createRadialGradient(W/2, H/2, 0, W/2, H/2, Math.max(W,H)*.75);
-  g.addColorStop(0, 'rgba(60,80,130,.10)');
-  g.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.fillStyle = g;
+  // vignette-ish center glow — cached, only rebuilt on resize
+  if (!glowGrad || glowW !== W || glowH !== H){
+    glowGrad = ctx.createRadialGradient(W/2, H/2, 0, W/2, H/2, Math.max(W,H)*.75);
+    glowGrad.addColorStop(0, 'rgba(60,80,130,.10)');
+    glowGrad.addColorStop(1, 'rgba(0,0,0,0)');
+    glowW = W; glowH = H;
+  }
+  ctx.fillStyle = glowGrad;
   ctx.fillRect(0, 0, W, H);
 }
 
@@ -777,7 +854,7 @@ function render(){
   }
 
   ctx.fillStyle = '#08090d';
-  ctx.fillRect(-40, -40, W + 80, H + 80);
+  ctx.fillRect(-60, -60, W + 120, H + 120);
   drawGrid();
 
   // pickups
@@ -786,11 +863,12 @@ function render(){
     const col = p.type === 'hp' ? '#4ade80' : '#fbbf24';
     ctx.save();
     ctx.translate(p.x, p.y + bob);
-    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 22);
-    g.addColorStop(0, col + 'cc'); g.addColorStop(1, col + '00');
-    ctx.fillStyle = g;
-    ctx.beginPath(); ctx.arc(0, 0, 22, 0, TAU); ctx.fill();
     ctx.fillStyle = col;
+    ctx.globalAlpha = .18;
+    ctx.beginPath(); ctx.arc(0, 0, 20, 0, TAU); ctx.fill();
+    ctx.globalAlpha = .34;
+    ctx.beginPath(); ctx.arc(0, 0, 11, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
     ctx.beginPath(); ctx.arc(0, 0, 6, 0, TAU); ctx.fill();
     ctx.fillStyle = '#08090d';
     ctx.font = 'bold 9px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
@@ -798,7 +876,7 @@ function render(){
     ctx.restore();
   }
 
-  // bullets
+  // bullets — no gradients (they're per-frame allocations and the main stutter source)
   for (const b of bullets){
     if (b.trail.length >= 4){
       ctx.strokeStyle = b.col;
@@ -811,12 +889,10 @@ function render(){
       ctx.stroke();
       ctx.globalAlpha = 1;
     }
-    const g = ctx.createRadialGradient(b.x, b.y, 0, b.x, b.y, b.slug ? 11 : 7);
-    g.addColorStop(0, '#fff');
-    g.addColorStop(.35, b.col);
-    g.addColorStop(1, b.col + '00');
-    ctx.fillStyle = g;
-    ctx.beginPath(); ctx.arc(b.x, b.y, b.slug ? 11 : 7, 0, TAU); ctx.fill();
+    ctx.fillStyle = b.col;
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.slug ? 4 : 2.8, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.slug ? 1.8 : 1.2, 0, TAU); ctx.fill();
   }
 
   // particles
@@ -831,14 +907,14 @@ function render(){
 
   // enemies
   for (const e of enemies){
-    drawGun(e.x, e.y, e.ang, e.kind, e.recoil, e.muzzle, e.hurt, e.boss ? 1 : 1, false);
+    drawGun(e.x, e.y, e.ang, e.kind, e.recoil, e.muzzle, e.hurt, e.boss ? 1.35 : 1.45, false);
     drawEnemyHp(e);
   }
 
   // player
   if (player.alive){
     const flick = player.iframe > 0 && Math.floor(time * 22) % 2 === 0;
-    if (!flick) drawGun(player.x, player.y, player.ang, player.kind, player.recoil, player.muzzle, 0, 1, true);
+    if (!flick) drawGun(player.x, player.y, player.ang, player.kind, player.recoil, player.muzzle, 0, 1.7, true);
     // aim line
     ctx.strokeStyle = 'rgba(255,138,107,.16)';
     ctx.lineWidth = 1;
@@ -912,6 +988,7 @@ function startGame(){
   bullets = []; enemies = []; parts = []; pickups = []; floaters = []; orbs = [];
   score = 0; wave = 0; waveTimer = 0; spawnQueue = 0; spawnCD = .6;
   shake = 0; time = 0; slowmo = 1; combo = 0; comboT = 0; bossQueued = false;
+  clickQueue = 0; mouse.down = false;
   mouse.x = W/2 + 120; mouse.y = H/2 - 60;
   el.menu.classList.add('hidden');
   el.over.classList.add('hidden');

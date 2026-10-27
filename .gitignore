@@ -1,1 +1,7 @@
 test.py
+test_*.py
+diag*.py
+probe*.py
+artcheck.html
+push.sh
+_probe*.html
