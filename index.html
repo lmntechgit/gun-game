@@ -244,10 +244,10 @@ const el = {
 /* ---------- gun archetypes (the "people") ---------- */
 const GUNS = {
   pistol:   { name:'PISTOL-9',  hp:100, spd:255, fireRate:.135, dmg:11, bspd:760,  bsprd:.045, col:'#ff5c3a', col2:'#ffb199', len:30, w:9  },
-  smg:      { name:'SMG-45',    hp:70,  spd:225, fireRate:.09,  dmg:6,  bspd:820,  bsprd:.12,  col:'#4ade80', col2:'#bbf7d0', len:26, w:8  },
-  shotgun:  { name:'SHOTGUN-12',hp:160, spd:165, fireRate:.75,  dmg:9,  bspd:640,  bsprd:.22,  col:'#fbbf24', col2:'#fef3c7', len:36, w:12, pellets:6 },
+  smg:      { name:'SMG-45',    hp:70,  spd:225, fireRate:.42,  dmg:4,  bspd:620,  bsprd:.20,  col:'#4ade80', col2:'#bbf7d0', len:26, w:8  },
+  shotgun:  { name:'SHOTGUN-12',hp:160, spd:165, fireRate:1.1,  dmg:6,  bspd:640,  bsprd:.22,  col:'#fbbf24', col2:'#fef3c7', len:36, w:12, pellets:6 },
   sniper:   { name:'SNIPER-X',  hp:60,  spd:190, fireRate:1.5,  dmg:44, bspd:1500, bsprd:.005, col:'#a78bfa', col2:'#ddd6fe', len:46, w:7,  slug:true },
-  rifle:    { name:'AR-15',     hp:120, spd:200, fireRate:.28,  dmg:15, bspd:900,  bsprd:.07,  col:'#38bdf8', col2:'#bae6fd', len:38, w:10 },
+  rifle:    { name:'AR-15',     hp:120, spd:200, fireRate:.55,  dmg:8, bspd:900,  bsprd:.07,  col:'#38bdf8', col2:'#bae6fd', len:38, w:10 },
   minigun:  { name:'MINI-G',    hp:300, spd:110, fireRate:.06,  dmg:5,  bspd:800,  bsprd:.16,  col:'#f472b6', col2:'#fbcfe8', len:42, w:16 },
   boss:     { name:'THE ARMORY',hp:1400,spd:95,  fireRate:.55,  dmg:14, bspd:560,  bsprd:.30,  col:'#ef4444', col2:'#fca5a5', len:70, w:30, pellets:9, boss:true }
 };
@@ -325,13 +325,14 @@ function nextWave(){
     spawnQueue = 1; // boss only
     bossQueued = true;
   } else {
-    spawnQueue = 4 + Math.floor(wave * 1.8);
+    spawnQueue = 3 + Math.floor(wave * 0.8);
     bossQueued = false;
   }
   spawnCD = .35;
-  maxOnScreen = Math.min(26, 5 + wave * 2);
+  // keep the arena readable: 3 on wave 1, +1 per wave, hard ceiling of 8
+  maxOnScreen = Math.min(8, 3 + Math.floor(wave * 0.7));
 }
-let bossQueued = false, maxOnScreen = 6;
+let bossQueued = false, maxOnScreen = 3;
 
 function pickKind(){
   if (wave <= 2) return 'smg';
